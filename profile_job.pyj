@@ -1,0 +1,99 @@
+from fever import rule, Node
+import random
+import datetime
+
+profile = rule(name='profile')
+profile._sort = True
+profile._params = {'c': 0}
+
+@profile.declare_targets
+def target(rule, nodes):
+  if rule.target.url not in nodes:
+    segments = nodes.where('scheme == ? and table == ?', 
+                           rule.source.scheme, rule.source.table)
+
+    if not segments:
+      return
+    
+    # examine a random third of the segments
+    segments = filter(lambda x: random.random() <1, segments)
+    yield Node(rule.target.url, 'fever', rule.target.table, datetime.datetime.now(), rule, segments)
+  
+@profile.map
+def map(record, params):
+  from fever.support import dumps
+  #from disco.node import worker
+  from disco.worker.classic import worker
+  params.c += 1
+  uid = "{0}:{1}".format(worker.this_partition(),params.c)
+
+  for key in record[1].items():
+    yield dumps(key + (key[1].__class__.__name__,)), 1
+  yield dumps(('__total__', uid, None)), 1 
+
+@profile.reduce
+def reduce(iter, params):
+  from collections import defaultdict
+
+  counts = defaultdict(float)
+  
+  last = None
+  for key, value in iter:
+    if key == last:
+      continue
+    last = key
+    attribute,attr_value,attr_type = json.loads(key)
+    counts[attribute] += 1
+  
+  total = counts['__total__']
+      
+  for key, val in counts.items():
+    yield key, [val, val/total]
+    
+    
+cube = rule(name='cube',
+  year=(lambda r:  r['created_at'].year),
+  month=(lambda r:  r['created_at'].month),
+  day=(lambda r:  r['created_at'].day),
+  hour=(lambda r:  r['created_at'].hour),
+)
+
+@cube.declare_targets
+def target(rule, nodes):
+  profile_node = 'profile_{0}'.format(rule.source.table)
+  if profile_node in nodes:
+    return rule.__class__._target(rule, nodes)
+  else:
+    return []
+  
+
+@cube.load('attributes')
+def load(rule, target_node, nodes):
+  # Load the file profile_<node> into params.attributes prior to running the job
+  table = 'profile_' + target_node._segments[0].table
+  return [nodes[table]]
+  
+
+@cube.map
+def map(record, params):
+  from fever.support import dumps
+  if not hasattr(params, 'sorted'):
+    params.sorted = sorted(params.attributes.items())
+
+  vals = []
+  for attr, (count, coverage) in params.sorted:
+    if coverage < .4:
+      vals.append((attr, record[1].get(attr)))
+  yield dumps(vals), 1
+
+ 
+@cube.reduce
+def reduce(iter, params):  
+  from disco.util import kvgroup
+  import json
+  counts = {}
+  for k, vs in kvgroup(sorted(iter)):
+    record = dict([i for i in json.loads(k) if i[1] is not None])
+    record['count'] = sum(vs)
+    yield ' ', record
+
